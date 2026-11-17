@@ -512,6 +512,407 @@ fn rewinding_a_cursor_drops_its_anchor_and_keeps_its_item_index() -> anyhow::Res
     Ok(())
 }
 
+#[tokio::test]
+async fn a_head_snapshot_before_pending_prevents_the_commit_race() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(2)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(1)))?;
+    state.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+
+    // The pending view lags: the note is not served even though its block is below the head.
+    // The head advances while pending runs, and the commit is beyond the earlier head's finality
+    // bound. The committed phase must still use the earlier observation; otherwise it consumes
+    // the commit as foreign before the note is ever known.
+    let index = ScriptedIndex::default();
+    *index.head.lock() = Some((5, 1));
+    *index.head_after_pending.lock() = Some((10, 1));
+    index.committed.lock().push(completion(&fixture.note_id, 6));
+    super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(state.committed_amount(&fixture.id)?, HoprBalance::zero());
+    // The later head must not let the commit past the note: the cursor stays before it.
+    assert_eq!(
+        state.cursor(CurvyEventKind::Committed)?,
+        Some(CurvyEventCursor::from(&position(1)))
+    );
+
+    // The pending view catches up; the note is discovered before its commit is processed.
+    index.pending.lock().push(fixture.note);
+    super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), receiver).await??, ten());
+    assert_eq!(state.committed_amount(&fixture.id)?, ten());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_committed_candidate_without_a_pending_cursor_stays_at_genesis() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(5)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+    let index = ScriptedIndex::default();
+    index.committed_candidates.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 6));
+    super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        state.cursor(CurvyEventKind::Pending)?,
+        Some(CurvyEventCursor::new(0, 0, 0, 0))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lagging_pending_note_self_heals_its_committed_replay() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(2)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(1)))?;
+    state.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+
+    // The pending view lags and the commit is below the sampled bound, so the forward committed
+    // phase consumes it as foreign. The next pending pass must notice the note is behind the
+    // committed cursor and queue a committed replay from the allocation's floor.
+    let index = ScriptedIndex::default();
+    *index.head.lock() = Some((5, 1));
+    *index.head_after_pending.lock() = Some((10, 1));
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+    super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(state.committed_amount(&fixture.id)?, HoprBalance::zero());
+
+    // The self-heal floor (1) is taken after pending and replayed in the same pass, not after
+    // the committed cursor (3).
+    index.pending.lock().push(fixture.note);
+    super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), receiver).await??, ten());
+    assert_eq!(state.committed_amount(&fixture.id)?, ten());
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unreadable_self_heal_floor_replays_from_genesis() -> anyhow::Result<()> {
+    let inner = RedbCurvyDepositState::in_memory()?;
+    let fixture = owned_candidate(2)?;
+    inner.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(3)))?;
+    inner.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    let state = Arc::new(FloorlessState::new(inner));
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+
+    // Consume the registration replay before the note is visible, leaving only the self-heal
+    // request for the pass below.
+    let earlier = ScriptedIndex::default();
+    super::lifecycle::run_pass_once(&earlier, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(tracker.take_replay().is_none());
+
+    state.fail_replay_floor();
+
+    // Pending discovers the note behind the committed cursor, but the floor read fails, so the
+    // self-heal falls back to genesis. The committed replay then fails after the request was
+    // taken, so it must be put back with that fallback intact.
+    let index = ScriptedIndex::default();
+    index.pending.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+    index
+        .fail_committed_on_second
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        super::lifecycle::run_pass_once(&index, &tracker)
+            .await
+            .map_err(anyhow::Error::msg)
+            .is_err()
+    );
+    assert_eq!(tracker.take_late_committed_replay(), Some(None));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_registration_landing_mid_pass_is_replayed_from_its_pending_half() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let a = owned_candidate(20)?;
+    let b = owned_candidate(1)?;
+    let tracker = Arc::new(CurvyLifecycleTracker::new(
+        Arc::new(RsCoreCurvyNoteDetector::for_token(4)),
+        state.clone(),
+    ));
+    state.store_scan_secret(&a.id, &a.scan_secret)?;
+    // The shared cursors are already past A's note, so only a replay can find it.
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        state.advance_cursor(kind, &CurvyEventCursor::from(&position(100)))?;
+    }
+    let other_secret = scan_secret("05", "06")?;
+    let _b_receiver = tracker.watch(b.id, b.address, other_secret, ten())?;
+
+    let index = ScriptedIndex::default();
+    index.pending.lock().push(a.note.clone());
+    index.committed.lock().push(completion(&a.note_id, 30));
+    let receiver = Arc::new(parking_lot::Mutex::new(None));
+    let slot = receiver.clone();
+    let hook_tracker = tracker.clone();
+    let (id, address, secret) = (a.id, a.address, a.scan_secret.clone());
+    *index.on_committed.lock() = Some(Box::new(move || {
+        *slot.lock() = Some(
+            hook_tracker
+                .watch(id, address, secret, ten())
+                .expect("mid-pass registration succeeds"),
+        );
+    }));
+
+    // B's registration replay already ran its pending half before A registered; A's request
+    // must survive this pass and be served, pending half included, by the next one.
+    super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(state.owned_note_ids()?.is_empty());
+    assert!(tracker.replay.lock().is_some(), "A's registration replay is kept");
+
+    super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(state.owned_note_ids()?, vec![a.note_id.clone()]);
+    let receiver = receiver.lock().take().expect("A's waiter was registered");
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), receiver).await??, ten());
+    assert_eq!(state.committed_amount(&a.id)?, ten());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_replay_held_back_by_finality_is_kept_for_the_next_pass() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(2)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        state.advance_cursor(kind, &CurvyEventCursor::from(&position(5)))?;
+    }
+    state.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(10)))?;
+    let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+
+    // The index is behind the durable cursor and serves no row above its head: the note is
+    // discovered, but its commit at block 9 is not in the replica yet.
+    let index = ScriptedIndex::default();
+    *index.head.lock() = Some((8, 1));
+    index.pending.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 9));
+    super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(state.committed_amount(&fixture.id)?, HoprBalance::zero());
+    assert!(tracker.replay.lock().is_none(), "the finished pending half is not kept");
+    let kept = tracker
+        .take_late_committed_replay()
+        .expect("the unfinished committed replay is kept");
+    assert_eq!(kept, Some(CurvyEventCursor::from(&position(5))));
+    tracker.restore_late_committed_replay(Some(kept));
+
+    // Once the index catches up, the kept committed replay reaches the commit without issuing a
+    // pending replay again.
+    *index.head.lock() = Some((10, 1));
+    index.pending_afters.lock().clear();
+    super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        index.pending_afters.lock().as_slice(),
+        &[Some(CurvyEventCursor::from(&position(5)))]
+    );
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), receiver).await??, ten());
+    assert_eq!(state.committed_amount(&fixture.id)?, ten());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pending_replay_lagging_behind_the_pending_cursor_is_kept() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(9)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(10)))?;
+    state.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+
+    // The replica is two blocks behind the pending cursor, so the note one block before the
+    // cursor is not served yet. The pending replay page ends short; it must be kept rather than
+    // consumed.
+    let index = ScriptedIndex::default();
+    *index.head.lock() = Some((8, 1));
+    index.pending.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 9));
+    let kept = super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(kept, "the unfinished replay is reported as kept");
+    assert_eq!(state.committed_amount(&fixture.id)?, HoprBalance::zero());
+    assert!(state.owned_note_ids()?.is_empty());
+    assert!(tracker.replay.lock().is_some(), "the unfinished replay is kept");
+
+    // Once the replica catches up, the kept pending replay scans the note and the commit.
+    *index.head.lock() = Some((10, 1));
+    let kept = super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(!kept, "the finished replay is not reported as kept");
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), receiver).await??, ten());
+    assert_eq!(state.committed_amount(&fixture.id)?, ten());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_committed_replay_keeps_the_self_heal_request() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(2)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(1)))?;
+    state.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(3)))?;
+    let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+
+    // Consume the registration replay before the note is visible, so only the self-heal request
+    // can be the one left after the failure.
+    let earlier = ScriptedIndex::default();
+    super::lifecycle::run_pass_once(&earlier, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(tracker.take_replay().is_none());
+
+    // Pending discovers the note behind the committed cursor and queues the self-heal. The
+    // committed replay then fails, after the request was taken, so it must be put back.
+    let index = ScriptedIndex::default();
+    index.pending.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+    index
+        .fail_committed_on_second
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        super::lifecycle::run_pass_once(&index, &tracker)
+            .await
+            .map_err(anyhow::Error::msg)
+            .is_err()
+    );
+    assert!(tracker.take_replay().is_none());
+    assert_eq!(
+        tracker.take_late_committed_replay(),
+        Some(Some(CurvyEventCursor::from(&position(1))))
+    );
+    assert_eq!(state.committed_amount(&fixture.id)?, HoprBalance::zero());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_registration_replay_merged_with_a_self_heal_uses_the_earlier_floor() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(2)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(3)))?;
+    state.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(5)))?;
+    let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+    let replay = tracker.take_replay().expect("the registration requests a replay");
+    assert_eq!(replay.committed, Some(CurvyEventCursor::from(&position(3))));
+    tracker.restore_late_committed_replay(Some(Some(CurvyEventCursor::from(&position(1)))));
+
+    let index = ScriptedIndex::default();
+    super::lifecycle::catch_up(&index, &tracker, Some(&replay))
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    // The forward phase starts after 5; the merged replay uses the self-heal's earlier floor 1.
+    assert_eq!(
+        index.committed_afters.lock().as_slice(),
+        &[
+            Some(CurvyEventCursor::from(&position(5))),
+            Some(CurvyEventCursor::from(&position(1))),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn committed_candidates_cover_a_commit_below_the_sampled_head() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(2)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(1)))?;
+    state.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+
+    // The pending view lags, but the source honours the other half of the contract: the note is
+    // served as a committed candidate together with its commit. Ownership is recorded before the
+    // page's completion is correlated, even though the commit is below the sampled bound.
+    let index = ScriptedIndex::default();
+    *index.head.lock() = Some((5, 1));
+    *index.head_after_pending.lock() = Some((10, 1));
+    index.committed_candidates.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+    super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), receiver).await??, ten());
+    assert_eq!(state.committed_amount(&fixture.id)?, ten());
+    Ok(())
+}
+
+fn assert_insert_edge<S: CurvyDepositState>(state: &S) -> anyhow::Result<()> {
+    let fixture = owned_candidate(1)?;
+    let watched = [(fixture.id, fixture.address, fixture.scan_secret.clone())];
+    let cursor = CurvyEventCursor::from(&fixture.note.position);
+    let detected = fixture
+        .detector
+        .detect_owned_note(&fixture.note, &watched)?
+        .expect("fixture is owned");
+    assert!(state.record_owned_candidate_if_new(&fixture.note_id, detected, &cursor)?);
+    let detected = fixture
+        .detector
+        .detect_owned_note(&fixture.note, &watched)?
+        .expect("fixture is owned");
+    let later = CurvyEventCursor::from(&position(9));
+    assert!(!state.record_owned_candidate_if_new(&fixture.note_id, detected, &later)?);
+    assert_eq!(state.owned_note_ids()?, vec![fixture.note_id]);
+    assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(cursor));
+    Ok(())
+}
+
+#[test]
+fn the_redb_insert_edge_reports_only_the_first_insert() -> anyhow::Result<()> {
+    assert_insert_edge(&RedbCurvyDepositState::in_memory()?)
+}
+
+#[test]
+fn the_default_insert_edge_reports_only_the_first_insert() -> anyhow::Result<()> {
+    assert_insert_edge(&FloorlessState::new(RedbCurvyDepositState::in_memory()?))
+}
+
+#[tokio::test]
+async fn process_candidate_reports_only_the_first_insert() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(1)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
+    let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+
+    let first = tracker.process_candidate(fixture.note.clone(), None).await?;
+    assert!(first.continue_processing);
+    assert_eq!(first.inserted, Some(fixture.id));
+    assert_eq!(tracker.state.owned_note_ids()?.len(), 1);
+    let duplicate = tracker.process_candidate(fixture.note, None).await?;
+    assert!(duplicate.continue_processing);
+    assert_eq!(duplicate.inserted, None);
+    assert_eq!(tracker.state.owned_note_ids()?.len(), 1);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tracker
 // ---------------------------------------------------------------------------
@@ -533,11 +934,11 @@ async fn tracker_filters_correlates_and_notifies_locally() -> anyhow::Result<()>
     unrelated.note_id = Hex32(format!("0x{:064x}", 0));
     unrelated.position = position(1);
     // A foreign event writes no cursor of its own; the pass commits one per page.
-    assert!(tracker.process_candidate(unrelated, None).await?);
+    assert!(tracker.process_candidate(unrelated, None).await?.continue_processing);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
 
     let candidate_cursor = CurvyEventCursor::from(&position(2));
-    assert!(tracker.process_candidate(fixture.note, None).await?);
+    assert!(tracker.process_candidate(fixture.note, None).await?.continue_processing);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(candidate_cursor));
     assert_eq!(state.committed_amount(&id)?, HoprBalance::zero());
 
@@ -561,7 +962,7 @@ async fn tracker_does_not_advance_without_registered_addresses() -> anyhow::Resu
     let fixture = owned_candidate(1)?;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
 
-    assert!(!tracker.process_candidate(fixture.note, None).await?);
+    assert!(!tracker.process_candidate(fixture.note, None).await?.continue_processing);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
     Ok(())
 }
@@ -578,7 +979,7 @@ async fn tracker_quarantines_malformed_public_candidates() -> anyhow::Result<()>
     let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
     fixture.note.view_tag = 256;
 
-    assert!(tracker.process_candidate(fixture.note, None).await?);
+    assert!(tracker.process_candidate(fixture.note, None).await?.continue_processing);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
     assert!(state.owned_note_ids()?.is_empty());
     Ok(())
@@ -612,7 +1013,7 @@ async fn tracker_resolves_the_vault_token_before_judging_a_candidate() -> anyhow
     // Blokli is back: the same event is now recognised as the allocation it is.
     vault.reachable.store(true, Ordering::SeqCst);
     let cursor = CurvyEventCursor::from(&fixture.note.position);
-    assert!(tracker.process_candidate(fixture.note, None).await?);
+    assert!(tracker.process_candidate(fixture.note, None).await?.continue_processing);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(cursor));
     assert_eq!(state.owned_note_ids()?.len(), 1);
     Ok(())
@@ -742,7 +1143,6 @@ async fn late_registration_replays_pending_and_committed_history() -> anyhow::Re
     let index = ScriptedIndex::default();
     index.pending.lock().push(fixture.note);
     index.committed.lock().push(completion(&fixture.note_id, 3));
-    *index.head.lock() = (10, 1);
     super::lifecycle::catch_up(&index, &tracker, replay.as_ref())
         .await
         .map_err(anyhow::Error::msg)?;
@@ -790,7 +1190,6 @@ fn bounded_replay() -> anyhow::Result<BoundedReplay> {
     index.pending.lock().push(foreign);
     index.committed.lock().push(completion(&window_note_id, 250));
     index.committed.lock().push(completion(&format!("0x{:064x}", 99), 350));
-    *index.head.lock() = (400, 1);
     Ok(BoundedReplay {
         state,
         tracker,
@@ -874,7 +1273,6 @@ async fn a_reorged_pending_anchor_is_rescanned_unanchored() -> anyhow::Result<()
     // Inside the margin before the stale cursor, so only the rewound rescan sees it.
     index.pending.lock().push(fixture.note);
     index.committed.lock().push(completion(&fixture.note_id, 295));
-    *index.head.lock() = (400, 1);
 
     for _ in 0..2 {
         super::lifecycle::catch_up(&index, &tracker, None)
@@ -910,7 +1308,6 @@ async fn a_reorged_committed_anchor_is_rescanned_from_before_it() -> anyhow::Res
     // resuming after that position would skip.
     let replacement = in_replacement_block(completion(&fixture.note_id, 300));
     index.committed.lock().push(replacement.clone());
-    *index.head.lock() = (400, 1);
 
     for _ in 0..2 {
         super::lifecycle::catch_up(&index, &tracker, None)
@@ -1005,7 +1402,6 @@ async fn an_empty_watch_set_stops_every_phase_without_moving_cursors() -> anyhow
     let index = ScriptedIndex::default();
     index.committed.lock().push(completion(&fixture.note_id, 3));
     index.committed_candidates.lock().push(fixture.note);
-    *index.head.lock() = (10, 1);
     super::lifecycle::catch_up(&index, &tracker, None)
         .await
         .map_err(anyhow::Error::msg)?;
@@ -1014,9 +1410,58 @@ async fn an_empty_watch_set_stops_every_phase_without_moving_cursors() -> anyhow
     Ok(())
 }
 
+#[tokio::test]
+async fn an_unfinished_replay_is_not_kept_for_an_empty_watch_set() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(2)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(RsCoreCurvyNoteDetector::for_token(4)), state.clone());
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        state.advance_cursor(kind, &CurvyEventCursor::from(&position(5)))?;
+    }
+    // Registered and then abandoned: nobody is waiting.
+    drop(tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?);
+    assert!(tracker.watched_allocations().is_empty());
+    // The pass envelope takes the registration request before the explicit replay below.
+    assert!(tracker.take_replay().is_some());
+
+    // A committed candidate meets the empty watch set during the replay. The replay window
+    // reaches past the sampled head, but there is nobody left to finish it for.
+    let index = ScriptedIndex::default();
+    *index.head.lock() = Some((5, 1));
+    let mut candidate = fixture.note;
+    candidate.position = position(2);
+    index.committed_candidates.lock().push(candidate);
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+    let replay = ReplayFrom {
+        pending: Some(CurvyEventCursor::from(&position(1))),
+        committed: Some(CurvyEventCursor::from(&position(1))),
+    };
+    super::lifecycle::catch_up(&index, &tracker, Some(&replay))
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        state.cursor(CurvyEventKind::Committed)?,
+        Some(CurvyEventCursor::from(&position(5)))
+    );
+    assert!(tracker.take_replay().is_none());
+    assert!(tracker.take_late_committed_replay().is_none());
+    Ok(())
+}
+
 /// A store that keeps no replay floors, like an external implementation written before they
-/// existed: it delegates everything and leaves `replay_floor` at its default.
-struct FloorlessState(RedbCurvyDepositState);
+/// existed: it delegates everything and leaves `replay_floor` at its default. Its flag makes the
+/// floor read fail, like an unreadable floor row.
+struct FloorlessState(RedbCurvyDepositState, AtomicBool);
+
+impl FloorlessState {
+    fn new(inner: RedbCurvyDepositState) -> Self {
+        Self(inner, AtomicBool::new(false))
+    }
+
+    fn fail_replay_floor(&self) {
+        self.1.store(true, Ordering::SeqCst);
+    }
+}
 
 impl CurvyDepositState for FloorlessState {
     fn cursor(&self, kind: CurvyEventKind) -> Result<Option<CurvyEventCursor>, CurvyStateError> {
@@ -1073,6 +1518,162 @@ impl CurvyDepositState for FloorlessState {
         self.0.remove_scan_secret(id)
     }
 
+    fn replay_floor(
+        &self,
+        id: &PixAddressId,
+        kind: CurvyEventKind,
+    ) -> Result<Option<CurvyEventCursor>, CurvyStateError> {
+        if self.1.load(Ordering::SeqCst) {
+            Err(CurvyStateError::Corrupt(format!(
+                "unreadable replay floor for {id:?} {kind:?}"
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn wipe_chain_state(&self) -> Result<(), CurvyStateError> {
+        self.0.wipe_chain_state()
+    }
+}
+
+#[derive(Default)]
+struct RacySecretGate {
+    state: std::sync::Mutex<RacySecretGateState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct RacySecretGateState {
+    initial_checks: usize,
+    both_checked: bool,
+    store_waiters: usize,
+    release_store: bool,
+}
+
+impl RacySecretGate {
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn wait_for_both_initial_checks(&self) {
+        let mut state = self.state.lock().expect("racy secret gate");
+        state.initial_checks += 1;
+        if state.initial_checks >= 2 {
+            state.both_checked = true;
+            self.changed.notify_all();
+            return;
+        }
+        let (state, wait) = self
+            .changed
+            .wait_timeout_while(state, Self::WAIT_TIMEOUT, |state| !state.both_checked)
+            .expect("racy secret gate");
+        assert!(!wait.timed_out(), "both callers did not reach scan_secret in time");
+        drop(state);
+    }
+
+    fn wait_for_store_waiters(&self, waiters: usize) {
+        let state = self.state.lock().expect("racy secret gate");
+        let (state, wait) = self
+            .changed
+            .wait_timeout_while(state, Self::WAIT_TIMEOUT, |state| state.store_waiters < waiters)
+            .expect("racy secret gate");
+        assert!(
+            !wait.timed_out(),
+            "both callers did not reach store_scan_secret in time"
+        );
+        drop(state);
+    }
+
+    fn wait_for_store_release(&self) {
+        let mut state = self.state.lock().expect("racy secret gate");
+        state.store_waiters += 1;
+        self.changed.notify_all();
+        let (state, wait) = self
+            .changed
+            .wait_timeout_while(state, Self::WAIT_TIMEOUT, |state| !state.release_store)
+            .expect("racy secret gate");
+        assert!(!wait.timed_out(), "the test did not release the secret store in time");
+        drop(state);
+    }
+
+    fn release_store(&self) {
+        let mut state = self.state.lock().expect("racy secret gate");
+        state.release_store = true;
+        self.changed.notify_all();
+    }
+}
+
+/// A store whose initial secret check is a check-then-store: both callers pass it before either
+/// may write.
+struct RacySecretState(FloorlessState, Arc<RacySecretGate>);
+
+impl RacySecretState {
+    fn new(inner: RedbCurvyDepositState) -> Self {
+        Self(FloorlessState::new(inner), Arc::new(RacySecretGate::default()))
+    }
+}
+
+impl CurvyDepositState for RacySecretState {
+    fn cursor(&self, kind: CurvyEventKind) -> Result<Option<CurvyEventCursor>, CurvyStateError> {
+        self.0.cursor(kind)
+    }
+
+    fn record_owned_candidate(
+        &self,
+        note_id: &str,
+        note: DetectedCurvyNote,
+        cursor: &CurvyEventCursor,
+    ) -> Result<(), CurvyStateError> {
+        self.0.record_owned_candidate(note_id, note, cursor)
+    }
+
+    fn record_completion(
+        &self,
+        note_id: &str,
+        leaf_index: u64,
+        cursor: &CurvyEventCursor,
+    ) -> Result<Option<CommittedCurvyNote>, CurvyStateError> {
+        self.0.record_completion(note_id, leaf_index, cursor)
+    }
+
+    fn advance_cursor(&self, kind: CurvyEventKind, cursor: &CurvyEventCursor) -> Result<(), CurvyStateError> {
+        self.0.advance_cursor(kind, cursor)
+    }
+
+    fn committed_amount(&self, id: &PixAddressId) -> Result<HoprBalance, CurvyStateError> {
+        self.0.committed_amount(id)
+    }
+
+    fn committed_notes(&self, id: &PixAddressId) -> Result<Vec<CommittedCurvyNote>, CurvyStateError> {
+        self.0.committed_notes(id)
+    }
+
+    fn remove_spent_notes(&self, id: &PixAddressId, note_ids: &[String]) -> Result<(), CurvyStateError> {
+        self.0.remove_spent_notes(id, note_ids)
+    }
+
+    fn owned_note_ids(&self) -> Result<Vec<String>, CurvyStateError> {
+        self.0.owned_note_ids()
+    }
+
+    fn store_scan_secret(&self, id: &PixAddressId, secret: &CurvyScanSecret) -> Result<(), CurvyStateError> {
+        // Hold the first write until the test has released it: without the pool's guard both
+        // callers must reach this point, as a plain check-then-store would.
+        self.1.wait_for_store_release();
+        self.0.store_scan_secret(id, secret)
+    }
+
+    fn scan_secret(&self, id: &PixAddressId) -> Result<Option<CurvyScanSecret>, CurvyStateError> {
+        let secret = self.0.scan_secret(id)?;
+        // Hold both callers at their initial miss check, so neither can insert before the other
+        // has also seen the absence.
+        self.1.wait_for_both_initial_checks();
+        Ok(secret)
+    }
+
+    fn remove_scan_secret(&self, id: &PixAddressId) -> Result<(), CurvyStateError> {
+        self.0.remove_scan_secret(id)
+    }
+
     fn wipe_chain_state(&self) -> Result<(), CurvyStateError> {
         self.0.wipe_chain_state()
     }
@@ -1088,7 +1689,7 @@ fn a_store_without_replay_floors_replays_from_genesis() -> anyhow::Result<()> {
     inner.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
     // The inner store does keep a floor; the wrapper does not expose it.
     assert!(inner.replay_floor(&fixture.id, CurvyEventKind::Committed)?.is_some());
-    let state = Arc::new(FloorlessState(inner));
+    let state = Arc::new(FloorlessState::new(inner));
     assert_eq!(state.replay_floor(&fixture.id, CurvyEventKind::Pending)?, None);
 
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
@@ -1138,6 +1739,8 @@ fn deposit_data_round_trips_through_the_wire_form() -> anyhow::Result<()> {
 struct ScriptedIndex {
     fail_pending: std::sync::atomic::AtomicBool,
     pending_calls: std::sync::atomic::AtomicUsize,
+    /// A head to install after the first pending query, simulating an index advancing mid-pass.
+    head_after_pending: parking_lot::Mutex<Option<(u64, u64)>>,
     /// The `after` of every `pending_notes` call, in order.
     pending_afters: parking_lot::Mutex<Vec<Option<CurvyEventCursor>>>,
     /// A block anchor the index refuses, as it would one whose block was reorganised away.
@@ -1147,7 +1750,16 @@ struct ScriptedIndex {
     /// Committed notes served as candidates, for a source whose pending view missed them.
     committed_candidates: parking_lot::Mutex<Vec<CurvyPendingNote>>,
     committed: parking_lot::Mutex<Vec<CurvyCommittedNote>>,
-    head: parking_lot::Mutex<(u64, u64)>,
+    /// The `after` of every `committed_notes` call, in order.
+    committed_afters: parking_lot::Mutex<Vec<Option<CurvyEventCursor>>>,
+    /// A registration to run on the first committed query, simulating one landing mid-pass.
+    on_committed: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    committed_calls: std::sync::atomic::AtomicUsize,
+    /// Fails every `committed_notes` call from the second one on, as an endpoint outage.
+    fail_committed_on_second: AtomicBool,
+    /// The indexed head and finality, or `None` until a test sets one. An unset head serves every
+    /// row and treats the whole index as final.
+    head: parking_lot::Mutex<Option<(u64, u64)>>,
     spent_nullifiers: parking_lot::Mutex<HashSet<String>>,
     known_notes: parking_lot::Mutex<Option<HashSet<String>>>,
 }
@@ -1191,13 +1803,18 @@ impl CurvyIndexSource for ScriptedIndex {
     ) -> Result<super::PendingNotesPage, String> {
         self.pending_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.pending_afters.lock().push(after.clone());
+        if let Some(head) = self.head_after_pending.lock().take() {
+            *self.head.lock() = Some(head);
+        }
         self.check_anchor(after.as_ref())?;
         if self.fail_pending.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("endpoint unavailable".to_owned());
         }
+        let head = *self.head.lock();
+        let visible = |note: &&CurvyPendingNote| head.is_none_or(|(head, _)| ordinal(&note.position).0 <= head);
         if self.snapshot_pending {
             return Ok(super::PendingNotesPage {
-                notes: self.pending.lock().clone(),
+                notes: self.pending.lock().iter().filter(visible).cloned().collect(),
                 has_more: false,
             });
         }
@@ -1206,6 +1823,7 @@ impl CurvyIndexSource for ScriptedIndex {
             self.pending
                 .lock()
                 .iter()
+                .filter(visible)
                 .filter(|note| after.is_none_or(|after| ordinal(&note.position) > after))
                 .take(first as usize)
                 .cloned()
@@ -1219,12 +1837,22 @@ impl CurvyIndexSource for ScriptedIndex {
         after: Option<CurvyEventCursor>,
         first: u32,
     ) -> Result<Vec<CurvyCommittedNote>, String> {
+        if let Some(on_committed) = self.on_committed.lock().take() {
+            on_committed();
+        }
+        self.committed_afters.lock().push(after.clone());
+        let call = self.committed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if self.fail_committed_on_second.load(std::sync::atomic::Ordering::SeqCst) && call >= 2 {
+            return Err("committed endpoint unavailable".to_owned());
+        }
         self.check_anchor(after.as_ref())?;
         let after = after.as_ref().map(cursor_ordinal);
+        let head = *self.head.lock();
         Ok(self
             .committed
             .lock()
             .iter()
+            .filter(|note| head.is_none_or(|(head, _)| ordinal(&note.position).0 <= head))
             .filter(|note| after.is_none_or(|after| ordinal(&note.position) > after))
             .take(first as usize)
             .cloned()
@@ -1237,10 +1865,12 @@ impl CurvyIndexSource for ScriptedIndex {
         first: u32,
     ) -> Result<Vec<CurvyPendingNote>, String> {
         let after = after.as_ref().map(cursor_ordinal);
+        let head = *self.head.lock();
         Ok(self
             .committed_candidates
             .lock()
             .iter()
+            .filter(|note| head.is_none_or(|(head, _)| ordinal(&note.position).0 <= head))
             .filter(|note| after.is_none_or(|after| ordinal(&note.position) > after))
             .take(first as usize)
             .cloned()
@@ -1248,7 +1878,7 @@ impl CurvyIndexSource for ScriptedIndex {
     }
 
     async fn indexed_head(&self) -> Result<(u64, u64), String> {
-        Ok(*self.head.lock())
+        Ok(self.head.lock().unwrap_or((u64::MAX, 0)))
     }
 
     async fn nullifier_spent(&self, nullifier: String) -> Result<bool, String> {
@@ -1758,7 +2388,6 @@ async fn pool_round_trip_generate_deposit_notify_and_sweep() -> anyhow::Result<(
     // Exit: waits for it to be committed and final.
     let notification = pool.notify_deposit(id, address, ten())?;
     harness.index.committed.lock().push(completion(&note_id, 6));
-    *harness.index.head.lock() = (8, 1);
     let (confirmed_id, confirmed_address, confirmed) = notification.await?;
     assert_eq!((confirmed_id, confirmed_address, confirmed), (id, address, ten()));
     assert_eq!(pool.state().committed_amount(&id)?, ten());
@@ -1790,7 +2419,6 @@ async fn a_note_committed_before_it_was_seen_pending_is_still_discovered() -> an
     harness.index.committed_candidates.lock().push(candidate);
     let notification = pool.notify_deposit(id, address, ten())?;
     harness.index.committed.lock().push(completion(&note_id, 6));
-    *harness.index.head.lock() = (8, 1);
     let (confirmed_id, confirmed_address, confirmed) = notification.await?;
     assert_eq!((confirmed_id, confirmed_address, confirmed), (id, address, ten()));
     assert_eq!(pool.state().committed_amount(&id)?, ten());
@@ -1829,7 +2457,6 @@ async fn a_sweep_removes_zero_amount_notes_from_the_store() -> anyhow::Result<()
     harness.index.pending.lock().push(pending);
     let notification = pool.notify_deposit(id, address, ten())?;
     harness.index.committed.lock().push(completion(&note_id, 6));
-    *harness.index.head.lock() = (8, 1);
     notification.await?;
 
     // A zero-amount note, as a store written before the scan skipped them holds.
@@ -1881,7 +2508,6 @@ async fn already_spent_notes_are_reconciled_away_before_sweeping() -> anyhow::Re
     harness.index.pending.lock().push(pending);
     let notification = pool.notify_deposit(id, address, ten())?;
     harness.index.committed.lock().push(completion(&note_id, 6));
-    *harness.index.head.lock() = (8, 1);
     notification.await?;
 
     // The chain already knows the nullifier: a sweep whose outcome was lost.
@@ -1897,6 +2523,91 @@ async fn already_spent_notes_are_reconciled_away_before_sweeping() -> anyhow::Re
     assert!(matches!(result, Err(StrategyError::CriteriaNotSatisfied)), "{result:?}");
     assert!(harness.adapter.withdrawals.lock().is_empty());
     assert!(pool.state().committed_notes(&id)?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn generate_deposit_data_records_its_replay_floors() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    let id = pix_id(1);
+    let state = harness.pool.state();
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(100)))?;
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(7)))?;
+
+    harness.pool.generate_deposit_data(&id).await?;
+
+    assert_eq!(
+        state.replay_floor(&id, CurvyEventKind::Pending)?,
+        Some(CurvyEventCursor::new(36, 0, 0, 0))
+    );
+    assert_eq!(
+        state.replay_floor(&id, CurvyEventKind::Committed)?,
+        Some(CurvyEventCursor::from(&position(7)))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_generate_deposit_data_agrees() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = RacySecretState::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
+    let cfg = CurvyDepositPoolConfig {
+        max_deposit_tracking_time: Duration::from_secs(5),
+        max_funding_time: Duration::from_secs(5),
+        token: Some(4),
+        ..Default::default()
+    };
+    let gate = Arc::clone(&state.1);
+    let pool = Arc::new(CurvyDepositPool::with_parts(
+        test_node().await?,
+        cfg,
+        ScriptedIndex::default(),
+        RecordingAdapter::consistent(),
+        RsCoreCurvyNoteDetector::for_token(4),
+        state,
+    ));
+    let id = pix_id(1);
+    let start = Arc::new(std::sync::Barrier::new(3));
+    let caller = |start: Arc<std::sync::Barrier>| {
+        let pool = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("caller runtime");
+            start.wait();
+            let data = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), pool.generate_deposit_data(&id)).await
+            });
+            data.expect("deposit data generation timed out")
+                .map_err(anyhow::Error::from)
+        })
+    };
+    let first = caller(Arc::clone(&start));
+    let second = caller(Arc::clone(&start));
+    // Release the writes once both callers are inside them (no pool guard), or once the first
+    // holds the pool's guard (so the second cannot reach the write).
+    let releaser_pool = Arc::clone(&pool);
+    let releaser = std::thread::spawn(move || {
+        gate.wait_for_store_waiters(1);
+        if let Ok(guard) = releaser_pool.scan_secret_init.try_lock() {
+            drop(guard);
+            gate.wait_for_store_waiters(2);
+        }
+        gate.release_store();
+    });
+    start.wait();
+    let a = first.join().expect("first caller")?;
+    let b = second.join().expect("second caller")?;
+    releaser.join().expect("releaser thread");
+    assert_eq!(a, b);
+    assert_eq!(
+        pool.state().scan_secret(&id)?.expect("stored secret").public(),
+        *a.scan_key()
+    );
     Ok(())
 }
 
@@ -1995,7 +2706,6 @@ async fn missing_notes_preserve_state_and_reconciliation_can_retry() -> anyhow::
     pool.state().store_scan_secret(&fixture.id, &fixture.scan_secret)?;
     // An incomplete/rebuilt index is not evidence of another chain.
     *harness.index.known_notes.lock() = Some(HashSet::new());
-    *harness.index.head.lock() = (10, 1);
     let first_id = pix_id(9);
     assert!(pool.generate_deposit_data(&first_id).await.is_err());
     assert_eq!(pool.state().owned_note_ids()?, vec![fixture.note_id.clone()]);
@@ -2026,7 +2736,6 @@ async fn state_from_the_same_chain_is_kept() -> anyhow::Result<()> {
     pool.state()
         .record_owned_candidate(&fixture.note_id, detected, &CurvyEventCursor::from(&position(1)))?;
     *harness.index.known_notes.lock() = Some(HashSet::from([fixture.note_id.clone()]));
-    *harness.index.head.lock() = (10, 1);
 
     let first_id = pix_id(9);
     pool.generate_deposit_data(&first_id).await?;
@@ -2338,7 +3047,6 @@ async fn a_sweep_waits_for_the_index_to_catch_up_instead_of_failing() -> anyhow:
     harness.index.pending.lock().push(pending);
     let notification = pool.notify_deposit(id, address, ten())?;
     harness.index.committed.lock().push(completion(&note_id, 6));
-    *harness.index.head.lock() = (8, 1);
     notification.await?;
 
     let started = std::time::Instant::now();
@@ -3082,11 +3790,11 @@ async fn an_index_behind_the_saved_cursor_preserves_recovery_state() -> anyhow::
         pool.state()
             .advance_cursor(kind, &CurvyEventCursor::from(&position(100)))?;
     }
-    *harness.index.head.lock() = (99, 1);
+    *harness.index.head.lock() = Some((99, 1));
     assert!(pool.generate_deposit_data(&id).await.is_err());
     assert_eq!(pool.state().scan_secret(&id)?.unwrap().public(), secret.public());
     assert_eq!(*harness.adapter.resets.lock(), 0);
-    *harness.index.head.lock() = (100, 1);
+    *harness.index.head.lock() = Some((100, 1));
     assert_eq!(*pool.generate_deposit_data(&id).await?.scan_key(), secret.public());
     Ok(())
 }
@@ -3151,7 +3859,6 @@ async fn full_pending_snapshot_reaches_committed_notes() -> anyhow::Result<()> {
         index.pending.lock().extend(std::iter::repeat_n(unrelated, total - 1));
         index.pending.lock().push(fixture.note);
         index.committed.lock().push(completion(&fixture.note_id, 3));
-        *index.head.lock() = (5, 1);
         tokio::time::timeout(
             Duration::from_secs(10),
             super::lifecycle::catch_up(&index, &tracker, Some(&ReplayFrom::default())),
@@ -3183,7 +3890,7 @@ async fn a_committed_note_at_the_indexed_head_is_confirmed() -> anyhow::Result<(
     let index = ScriptedIndex::default();
     index.pending.lock().push(fixture.note);
     index.committed.lock().push(completion(&fixture.note_id, 3));
-    *index.head.lock() = (3, 0);
+    *index.head.lock() = Some((3, 0));
     tokio::time::timeout(
         Duration::from_secs(10),
         super::lifecycle::catch_up(&index, &tracker, None),
@@ -3228,6 +3935,39 @@ async fn watcher_failures_back_off_and_success_resets_polling() -> anyhow::Resul
     tokio::time::advance(Duration::from_millis(250)).await;
     tokio::task::yield_now().await;
     assert_eq!(index.pending_calls.load(Ordering::SeqCst), 7);
+    worker.abort();
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn watcher_kept_replays_wait_the_normal_poll_delay() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(1)?;
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(10)))?;
+    let tracker = Arc::new(CurvyLifecycleTracker::new(Arc::new(fixture.detector), state));
+    let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret, ten())?;
+    let index = Arc::new(ScriptedIndex::default());
+    // The replica is behind the pending replay window, so every pass keeps that replay.
+    *index.head.lock() = Some((8, 1));
+    let worker = tokio::spawn(super::lifecycle::run_watcher(
+        index.clone(),
+        tracker.clone(),
+        Duration::from_secs(10),
+    ));
+    tokio::task::yield_now().await;
+    // Each pass queries pending once forward and once for the kept replay.
+    assert_eq!(index.pending_calls.load(Ordering::SeqCst), 2);
+    // A kept replay is retried after the normal poll delay, without doubling the delay.
+    for pass in [2, 3, 4] {
+        tokio::time::advance(Duration::from_millis(249)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(index.pending_calls.load(Ordering::SeqCst), 2 * (pass - 1));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(index.pending_calls.load(Ordering::SeqCst), 2 * pass);
+        assert!(tracker.replay.lock().is_some());
+    }
     worker.abort();
     Ok(())
 }

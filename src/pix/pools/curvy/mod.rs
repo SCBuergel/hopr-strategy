@@ -1066,6 +1066,10 @@ pub struct CurvyDepositPool<N, I = NoteIndex, A = RsSdkCurvyAdapter<BlokliClient
     cfg: CurvyDepositPoolConfig,
     reconciled: tokio::sync::OnceCell<()>,
     watcher: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Serializes this pool's miss path of `generate_deposit_data`, because `store_scan_secret`
+    /// replaces an existing secret. It does not protect callers that write the state outside this
+    /// pool.
+    scan_secret_init: tokio::sync::Mutex<()>,
 }
 
 impl<N> CurvyDepositPool<N>
@@ -1351,6 +1355,7 @@ where
             cfg,
             reconciled: tokio::sync::OnceCell::new(),
             watcher: parking_lot::Mutex::new(None),
+            scan_secret_init: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1700,12 +1705,27 @@ where
         {
             Some(existing) => existing,
             None => {
-                let secret = Self::generate_scan_secret()?;
-                self.tracker
+                // Only the miss path is serialized: a hit never waits. The re-check under this
+                // one per-pool lock keeps this pool's callers from overwriting each other's secret;
+                // `store_scan_secret` replaces an existing secret, and a caller that writes the
+                // state outside this pool is not covered.
+                let _initializing = self.scan_secret_init.lock().await;
+                match self
+                    .tracker
                     .state
-                    .store_scan_secret(id, &secret)
-                    .map_err(CurvyDepositPoolError::from)?;
-                secret
+                    .scan_secret(id)
+                    .map_err(CurvyDepositPoolError::from)?
+                {
+                    Some(existing) => existing,
+                    None => {
+                        let generated = Self::generate_scan_secret()?;
+                        self.tracker
+                            .state
+                            .store_scan_secret(id, &generated)
+                            .map_err(CurvyDepositPoolError::from)?;
+                        generated
+                    }
+                }
             }
         };
         Ok(CurvyDepositData::new(*id, secret.public()))

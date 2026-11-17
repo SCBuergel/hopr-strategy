@@ -8,10 +8,12 @@
 //! passed.
 //!
 //! The watcher is one task per pool, started on the first registration and aborted when the pool
-//! is dropped. Each pass catches pending notes up *first*, then committed ones, so that a
-//! commitment can only ever correlate against an ownership decision that is already durable.
-//! Committed events are consumed up to the source's indexed head, less any further finality the
-//! source asks for; Blokli and the Curvy indexer serve only final blocks and ask for none.
+//! is dropped. Each pass samples the indexed head, catches pending notes up *first*, then committed
+//! ones, so that a commitment can only ever correlate against an ownership decision that is already
+//! durable. Committed events are consumed only up to that sampled head, less any further finality
+//! the source asks for — Blokli and the Curvy indexer serve only final blocks and ask for none — so
+//! a commit that lands while pending is running cannot overtake the note discovered by the same
+//! pass.
 //!
 //! Every allocation registers its own scan secret, so the watcher's candidate set is exactly the
 //! set of allocations somebody is waiting on. While that set is empty the pending cursor is
@@ -20,9 +22,16 @@
 //! families, because the shared cursors may already have moved past its note. The replay starts at
 //! the allocation's replay floor (see [`CurvyDepositState::replay_floor`]) — genesis when it has none
 //! — and is bounded by the durable cursors, which it never moves. Within each family a pass
-//! first scans what is new since the durable cursor and only then replays the window behind it;
-//! all pending phases still precede all committed ones, so a fresh deposit is not delayed by
-//! history. Foreign notes cost one cursor commit per page, not one each.
+//! first scans what is new since the durable cursor and only then replays the window behind it.
+//! The head is sampled before the pending phases, so the forward committed bound is as old as
+//! this pass's pending forward and pending replay phases; all pending phases still precede all
+//! committed ones, and a commit that becomes final during them is confirmed by the next pass.
+//! A pending phase compares each newly inserted note with the committed cursor sampled
+//! before pending; a note that is already behind it, because the source's pending view lagged,
+//! queues a committed replay from that allocation's floor. The self-heal floor is taken after the
+//! pending phases, merged with any late-registration committed floor, and replayed in the same
+//! pass. A replay that stops before its window end is kept for the next pass. Foreign notes cost
+//! one cursor commit per page, not one each.
 
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
@@ -77,12 +86,25 @@ impl PendingNotesPage {
 ///
 /// Narrow on purpose: it is what a test has to fake to drive the whole pool without a Blokli, and
 /// it is implemented for any [`BlokliQueryClient`] by [`BlokliIndex`].
+///
+/// Forward phases tolerate a pending view that lags the committed view: the first insert of an
+/// owned note at or before the committed cursor queues a committed replay from the allocation's
+/// floor, and that replay runs in the same pass.
+///
+/// Replays infer completion from the head sampled at the start of the pass, so the notes queries
+/// of a pass must be at least as fresh as that head. A source that serves a replay window from an
+/// older view can end the replay early.
 #[async_trait]
 pub trait CurvyIndexSource: Send + Sync + 'static {
     /// Pending events after `after`, or one complete pinned snapshot for snapshot sources.
+    ///
+    /// Pages are in increasing chain-position order; the trait documentation states the freshness
+    /// contract that forward phases and replays rely on.
     async fn pending_notes(&self, after: Option<CurvyEventCursor>, first: u32) -> Result<PendingNotesPage, String>;
 
     /// One page of committed notes strictly after `after`, oldest first.
+    ///
+    /// See the trait documentation for the freshness contract.
     async fn committed_notes(
         &self,
         after: Option<CurvyEventCursor>,
@@ -91,6 +113,9 @@ pub trait CurvyIndexSource: Send + Sync + 'static {
 
     /// The highest block the indexer has processed, and how many further confirmations a committed
     /// note at that block still needs: zero for a source that serves only final blocks.
+    ///
+    /// Discovery samples this at the start of a pass; see the trait documentation for the freshness
+    /// contract.
     async fn indexed_head(&self) -> Result<(u64, u64), String>;
 
     /// Whether the chain has already seen `nullifier` (a `0x`-prefixed 32-byte hex string).
@@ -245,6 +270,24 @@ fn is_beyond(cursor: &CurvyEventCursor, end: Option<&CurvyEventCursor>) -> bool 
     matches!((cursor_order(cursor), cursor_order(end)), (Ok(cursor), Ok(end)) if cursor > end)
 }
 
+/// The earlier of two requested floors; a request that is absent yields the other.
+fn merge_floor(
+    first: Option<Option<CurvyEventCursor>>,
+    second: Option<Option<CurvyEventCursor>>,
+) -> Option<Option<CurvyEventCursor>> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(earlier(a, b)),
+        (first, second) => first.or(second),
+    }
+}
+
+/// Whether `window_end` lies at or before `through`, so a replay of the window can finish.
+///
+/// See [`CurvyIndexSource`] for the source-freshness contract.
+fn window_covered(window_end: Option<&CurvyEventCursor>, through: u64) -> bool {
+    window_end.is_none_or(|end| cursor_component(&end.block, "window end block").is_ok_and(|block| block <= through))
+}
+
 impl ReplayFrom {
     pub(super) fn merge(self, other: Self) -> Self {
         Self {
@@ -254,12 +297,21 @@ impl ReplayFrom {
     }
 }
 
+/// The result of judging one candidate. `inserted` carries the allocation only on the first
+/// insert; pending phases use it to detect a note that arrives after its commit cursor passed.
+#[derive(Debug)]
+pub(super) struct CandidateOutcome {
+    pub(super) continue_processing: bool,
+    pub(super) inserted: Option<PixAddressId>,
+}
+
 /// Correlates Blokli's public note events with the allocations this node is waiting on.
 pub struct CurvyLifecycleTracker<S> {
     detector: Detector,
     pub(super) state: Arc<S>,
     waiters: parking_lot::Mutex<HashMap<PixAddressId, WatchedAllocation>>,
     pub(super) replay: parking_lot::Mutex<Option<ReplayFrom>>,
+    late_committed: parking_lot::Mutex<Option<Option<CurvyEventCursor>>>,
 }
 
 impl<S> CurvyLifecycleTracker<S>
@@ -287,6 +339,7 @@ where
             state,
             waiters: Default::default(),
             replay: Default::default(),
+            late_committed: Default::default(),
         }
     }
 
@@ -377,7 +430,7 @@ where
             .collect()
     }
 
-    /// Takes the pending historical replay request, if any.
+    /// Takes the registration historical replay request, if any.
     pub(super) fn take_replay(&self) -> Option<ReplayFrom> {
         self.replay.lock().take()
     }
@@ -393,6 +446,29 @@ where
                 None => replay,
             });
         }
+    }
+
+    /// A note was first inserted after its block was already behind the durable committed cursor.
+    /// Queue one committed replay from that allocation's floor; this is the source-freshness
+    /// self-heal for a lagging pending view. A failed floor read is conservatively genesis.
+    fn request_late_committed_replay(&self, id: PixAddressId) {
+        let floor = match self.state.replay_floor(&id, CurvyEventKind::Committed) {
+            Ok(floor) => floor,
+            Err(error) => {
+                tracing::warn!(allocation = ?id, %error, "unreadable Curvy committed replay floor; replaying from genesis");
+                None
+            }
+        };
+        self.restore_late_committed_replay(Some(floor));
+    }
+
+    pub(super) fn take_late_committed_replay(&self) -> Option<Option<CurvyEventCursor>> {
+        self.late_committed.lock().take()
+    }
+
+    pub(super) fn restore_late_committed_replay(&self, replay: Option<Option<CurvyEventCursor>>) {
+        let mut slot = self.late_committed.lock();
+        *slot = merge_floor(slot.take(), replay);
     }
 
     fn notify_waiters(&self, id: PixAddressId, committed: HoprBalance) {
@@ -415,8 +491,8 @@ where
         }
     }
 
-    /// Returns `false` when processing must pause because no deposit address is
-    /// currently registered. In that case the cursor is intentionally left
+    /// The outcome's `continue_processing` is `false` when processing must pause because no
+    /// deposit address is currently registered. In that case the cursor is intentionally left
     /// untouched so the event is replayed after a waiter is added.
     ///
     /// Foreign and quarantined events write no cursor; the caller commits one per page. An owned
@@ -426,10 +502,13 @@ where
         &self,
         candidate: CurvyPendingNote,
         hold: Option<&CurvyEventCursor>,
-    ) -> Result<bool, CurvyLifecycleError> {
+    ) -> Result<CandidateOutcome, CurvyLifecycleError> {
         let watched = self.watched_allocations();
         if watched.is_empty() {
-            return Ok(false);
+            return Ok(CandidateOutcome {
+                continue_processing: false,
+                inserted: None,
+            });
         }
 
         let cursor = CurvyEventCursor::from(&candidate.position);
@@ -445,22 +524,36 @@ where
                     %error,
                     "quarantining malformed public Curvy pending-note event"
                 );
-                return Ok(true);
+                return Ok(CandidateOutcome {
+                    continue_processing: true,
+                    inserted: None,
+                });
             }
         };
 
-        if let Some(note) = detected {
+        let inserted = if let Some(note) = detected {
             let allocation = note.deposit.id;
-            self.state
-                .record_owned_candidate(&candidate.note_id.0, note, hold.unwrap_or(&cursor))
+            let inserted = self
+                .state
+                .record_owned_candidate_if_new(&candidate.note_id.0, note, hold.unwrap_or(&cursor))
                 .map_err(CurvyLifecycleError::from)?;
-            tracing::info!(
-                note_id = %candidate.note_id.0,
-                allocation = ?allocation,
-                "discovered Curvy PIX pending note through Blokli"
-            );
-        }
-        Ok(true)
+            if inserted {
+                tracing::info!(
+                    note_id = %candidate.note_id.0,
+                    allocation = ?allocation,
+                    "discovered Curvy PIX pending note through Blokli"
+                );
+                Some(allocation)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(CandidateOutcome {
+            continue_processing: true,
+            inserted,
+        })
     }
 
     /// Like [`process_candidate`](Self::process_candidate): malformed events are quarantined
@@ -509,14 +602,18 @@ where
 
 /// One pending-family phase. Forward (`replay == false`) starts after `start`, hold-free, and
 /// commits the cursor once per page; a replay stops after `window_end` and holds the durable
-/// cursor instead. Returns `false` when the watch set ran empty and the pass must stop.
+/// cursor instead. `committed_before` is the committed cursor sampled before pending: a newly
+/// inserted note at or before it queues a committed self-heal replay. `sampled_head` bounds a
+/// replay whose source is still behind its window.
 async fn pending_phase<I, S>(
     client: &I,
     tracker: &CurvyLifecycleTracker<S>,
     start: Option<CurvyEventCursor>,
     window_end: Option<&CurvyEventCursor>,
+    committed_before: Option<&CurvyEventCursor>,
     replay: bool,
-) -> Result<bool, String>
+    sampled_head: u64,
+) -> Result<PhaseOutcome, String>
 where
     I: CurvyIndexSource,
     S: CurvyDepositState,
@@ -535,17 +632,25 @@ where
         let has_more = page.has_more;
         let mut last = None;
         let mut stopped = false;
+        let mut beyond_window = false;
         let mut watching = true;
         for note in page.notes {
             let position = CurvyEventCursor::from(&note.position);
             if replay && is_beyond(&position, window_end) {
                 stopped = true;
+                beyond_window = true;
                 break;
             }
-            watching = tracker
+            let outcome = tracker
                 .process_candidate(note, hold.as_ref())
                 .await
                 .map_err(|error| error.to_string())?;
+            if let Some(id) = outcome.inserted
+                && committed_before.is_some_and(|committed| !is_beyond(&position, Some(committed)))
+            {
+                tracker.request_late_committed_replay(id);
+            }
+            watching = outcome.continue_processing;
             if !watching {
                 stopped = true;
                 break;
@@ -561,9 +666,21 @@ where
                 .map_err(|error| error.to_string())?;
         }
         if stopped || !has_more {
-            return Ok(watching);
+            // A replay whose window extends past the replica has more to scan even when the
+            // page ended short.
+            let reached_end = !replay || beyond_window || window_covered(window_end, sampled_head);
+            return Ok(PhaseOutcome { watching, reached_end });
         }
     }
+}
+
+/// How a family phase ended. `reached_end` is false when a replay stopped before its window
+/// end, either at the finality bound or because its window lies beyond the sampled head. A phase
+/// that stops because the watch set ran empty reports `watching = false`, so nobody waits for a
+/// resumed replay.
+struct PhaseOutcome {
+    watching: bool,
+    reached_end: bool,
 }
 
 /// One committed-family phase, shaped like [`pending_phase`]. Only notes this store owns (or
@@ -575,7 +692,7 @@ async fn committed_phase<I, S>(
     window_end: Option<&CurvyEventCursor>,
     finalized_through: u64,
     replay: bool,
-) -> Result<bool, String>
+) -> Result<PhaseOutcome, String>
 where
     I: CurvyIndexSource,
     S: CurvyDepositState,
@@ -600,17 +717,26 @@ where
         // cursor, which this phase must not move.
         if page_len > 0 {
             let candidates = client.committed_candidates(after.clone(), page_len as u32).await?;
+            // A committed candidate can be the first owned note seen. Writing its own position
+            // as the pending cursor would make the next paged pending pass skip earlier,
+            // still-uncommitted notes. Keep the cursor at genesis until the pending family has
+            // actually scanned something.
+            let pending = tracker
+                .state
+                .cursor(CurvyEventKind::Pending)
+                .map_err(|error| error.to_string())?;
+            let pending_hold = pending.unwrap_or_else(|| CurvyEventCursor::new(0, 0, 0, 0));
             for candidate in candidates {
-                let pending = tracker
-                    .state
-                    .cursor(CurvyEventKind::Pending)
-                    .map_err(|error| error.to_string())?;
                 if !tracker
-                    .process_candidate(candidate, pending.as_ref())
+                    .process_candidate(candidate, Some(&pending_hold))
                     .await
                     .map_err(|error| error.to_string())?
+                    .continue_processing
                 {
-                    return Ok(false);
+                    return Ok(PhaseOutcome {
+                        watching: false,
+                        reached_end: false,
+                    });
                 }
             }
         }
@@ -627,13 +753,16 @@ where
             HashSet::new()
         };
         let mut stop = false;
+        let mut beyond_window = false;
         let mut last = None;
         for note in page {
             let event_block =
                 cursor_component(&note.position.block, "completion block").map_err(|error| error.to_string())?;
             let position = CurvyEventCursor::from(&note.position);
-            if event_block > finalized_through || (replay && is_beyond(&position, window_end)) {
+            let beyond = replay && is_beyond(&position, window_end);
+            if event_block > finalized_through || beyond {
                 stop = true;
+                beyond_window = beyond;
                 break;
             }
             if note_id_key(&note.note_id.0).map_or(true, |key| owned.contains(&key)) {
@@ -652,7 +781,13 @@ where
                 .map_err(|error| error.to_string())?;
         }
         if stop || page_len < QUERY_PAGE_SIZE as usize {
-            return Ok(true);
+            // A committed replay is finished only once its whole window is final, or a row
+            // beyond it proves there is nothing left inside.
+            let reached_end = !replay || beyond_window || window_covered(window_end, finalized_through);
+            return Ok(PhaseOutcome {
+                watching: true,
+                reached_end,
+            });
         }
     }
 }
@@ -666,14 +801,14 @@ where
 /// anchor, so the events of replacement blocks are seen, the old position's included; a forward
 /// phase also replaces its durable cursor with canonical positions as it goes. The error cannot
 /// be told apart from an outage, so an outage costs one more query: a second failure is returned.
-async fn recovering_anchor<F, Fut>(
+async fn recovering_anchor<F, Fut, T>(
     family: &'static str,
     start: Option<CurvyEventCursor>,
     mut phase: F,
-) -> Result<bool, String>
+) -> Result<T, String>
 where
     F: FnMut(Option<CurvyEventCursor>) -> Fut,
-    Fut: Future<Output = Result<bool, String>>,
+    Fut: Future<Output = Result<T, String>>,
 {
     let anchored = start.as_ref().filter(|cursor| cursor.block_hash.is_some()).cloned();
     match (phase(start).await, anchored) {
@@ -687,61 +822,165 @@ where
 
 /// One catch-up pass over both event families. See the module docs for the ordering.
 ///
-/// The forward phases consume what is new since the durable cursors; the replay phases, when
-/// `replay` is requested, then revisit the window `(replay start, durable cursor before this
-/// pass]` for the allocations registered since. All pending phases precede all committed ones.
-/// Every phase recovers from a start whose block was reorganised away: see [`recovering_anchor`].
-pub(super) async fn catch_up<I, S>(
+/// The forward phases consume what is new since the durable cursors. A registration replay
+/// requested by `watch()` is taken by the pass envelope as `replay` and, after the forward phases,
+/// revisits both families from the requested floors up to the durable cursors before this pass,
+/// for the allocations registered since. The pending phases also compare each newly inserted note
+/// with the committed cursor sampled at the start of the pass; a first insert at or before that
+/// cursor queues a committed self-heal floor for its allocation in the tracker's late-committed
+/// slot. The pass takes that slot after all pending phases and merges it with the registration
+/// replay's committed start, the earlier floor winning; the merged start is replayed in the
+/// committed window, and it never starts a pending replay. A replay that stopped before its window
+/// end is kept for the next pass. All pending phases precede all committed ones. Every phase
+/// recovers from a start whose block was reorganised away: see [`recovering_anchor`]. Reports
+/// whether an unfinished replay was kept for the next pass.
+async fn catch_up_pass<I, S>(
     client: &I,
     tracker: &CurvyLifecycleTracker<S>,
     replay: Option<&ReplayFrom>,
-) -> Result<(), String>
+) -> Result<bool, PassError>
 where
     I: CurvyIndexSource,
     S: CurvyDepositState,
 {
-    let p0 = tracker
-        .state
-        .cursor(CurvyEventKind::Pending)
-        .map_err(|error| error.to_string())?;
-    let p0_end = p0.as_ref();
-    if !recovering_anchor("pending", p0.clone(), move |from| {
-        pending_phase(client, tracker, from, None, false)
-    })
-    .await?
-    {
-        return Ok(());
-    }
-    if let (Some(replay), Some(_)) = (replay, p0_end)
-        && !recovering_anchor("pending", replay.pending.clone(), move |from| {
-            pending_phase(client, tracker, from, p0_end, true)
-        })
-        .await?
-    {
-        return Ok(());
-    }
-
-    let (indexed_block, finality) = client.indexed_head().await?;
-    let finalized_through = indexed_block.saturating_sub(finality);
-    let c0 = tracker
-        .state
-        .cursor(CurvyEventKind::Committed)
-        .map_err(|error| error.to_string())?;
-    let c0_end = c0.as_ref();
-    if !recovering_anchor("committed", c0.clone(), move |from| {
-        committed_phase(client, tracker, from, None, finalized_through, false)
-    })
-    .await?
-    {
-        return Ok(());
-    }
-    if let (Some(replay), Some(_)) = (replay, c0_end) {
-        recovering_anchor("committed", replay.committed.clone(), move |from| {
-            committed_phase(client, tracker, from, c0_end, finalized_through, true)
+    let mut replayed = replay.is_some();
+    let result: Result<bool, String> = async {
+        // Sample the indexed head before the pending phases. Every committed event this pass is
+        // allowed to process was final at this observation. A commit that lands while pending is
+        // running therefore cannot be consumed before the note discovered in that same pass; it is
+        // processed on a later pass, after the ownership decision is durable.
+        let (indexed_block, finality) = client.indexed_head().await?;
+        let finalized_through = indexed_block.saturating_sub(finality);
+        let c0 = tracker
+            .state
+            .cursor(CurvyEventKind::Committed)
+            .map_err(|error| error.to_string())?;
+        let c0_end = c0.as_ref();
+        let p0 = tracker
+            .state
+            .cursor(CurvyEventKind::Pending)
+            .map_err(|error| error.to_string())?;
+        let p0_end = p0.as_ref();
+        let pending = recovering_anchor("pending", p0.clone(), move |from| {
+            pending_phase(client, tracker, from, None, c0_end, false, indexed_block)
         })
         .await?;
+        if !pending.watching {
+            return Ok(false);
+        }
+
+        let mut pending_unfinished = false;
+        if let (Some(replay), Some(_)) = (replay, p0_end) {
+            let pending = recovering_anchor("pending", replay.pending.clone(), move |from| {
+                pending_phase(client, tracker, from, p0_end, c0_end, true, indexed_block)
+            })
+            .await?;
+            if !pending.watching {
+                return Ok(false);
+            }
+            pending_unfinished = !pending.reached_end;
+        }
+
+        let committed = recovering_anchor("committed", c0.clone(), move |from| {
+            committed_phase(client, tracker, from, None, finalized_through, false)
+        })
+        .await?;
+        if !committed.watching {
+            return Ok(false);
+        }
+
+        // Take the self-heal request after every pending phase ran, so a note first seen behind
+        // the committed cursor is replayed in this pass. A late-registration committed floor and
+        // the self-heal floor cover the same window: merge their starts and run it once.
+        let late_committed = tracker.take_late_committed_replay();
+        replayed |= late_committed.is_some();
+        let merged_floor = merge_floor(replay.map(|replay| replay.committed.clone()), late_committed.clone());
+        let mut committed_unfinished = false;
+        if let (Some(floor), Some(window_end)) = (merged_floor.clone(), c0_end) {
+            let committed = match recovering_anchor("committed", floor, move |from| {
+                committed_phase(client, tracker, from, Some(window_end), finalized_through, true)
+            })
+            .await
+            {
+                Ok(committed) => committed,
+                Err(error) => {
+                    tracker.restore_late_committed_replay(late_committed);
+                    return Err(error);
+                }
+            };
+            if !committed.watching {
+                // The watch set ran empty: there is nobody to resume the replay for.
+                return Ok(false);
+            }
+            committed_unfinished = !committed.reached_end;
+        } else if merged_floor.is_some() {
+            // A self-heal floor was taken but there is no committed window to replay it against
+            // yet; keep it for the next pass.
+            tracker.restore_late_committed_replay(late_committed);
+        }
+        if pending_unfinished {
+            // The pending half has not finished, so the whole registration replay is owed again.
+            tracker.restore_failed_replay(replay.cloned());
+        }
+        if committed_unfinished {
+            // Only the committed window is unfinished; its merged start also covers any
+            // self-heal floor that was part of it.
+            tracker.restore_late_committed_replay(merged_floor);
+        }
+        let replay_kept = pending_unfinished || committed_unfinished;
+        if replay_kept {
+            tracing::debug!(
+                sampled_head = indexed_block,
+                pending = pending_unfinished,
+                committed = committed_unfinished,
+                "keeping an unfinished Curvy replay because the sampled head does not cover its window"
+            );
+        }
+        Ok(replay_kept)
     }
-    Ok(())
+    .await;
+    result.map_err(|error| PassError { error, replayed })
+}
+
+/// Test-facing wrapper around [`catch_up_pass`] for phases that do not inspect the outcome.
+#[cfg(test)]
+pub(super) async fn catch_up<I, S>(
+    client: &I,
+    tracker: &CurvyLifecycleTracker<S>,
+    replay: Option<&ReplayFrom>,
+) -> Result<(), PassError>
+where
+    I: CurvyIndexSource,
+    S: CurvyDepositState,
+{
+    catch_up_pass(client, tracker, replay).await.map(|_| ())
+}
+
+/// A failed catch-up pass and whether it took a replay request. The watcher warning uses the
+/// latter rather than peeking at the slots after the pass restored them.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub(super) struct PassError {
+    error: String,
+    replayed: bool,
+}
+
+/// Runs one watcher pass, taking the replay slot and restoring it if the pass fails. This is the
+/// exact envelope `run_watcher` uses; tests drive it directly so production wiring is covered.
+/// Returns whether the pass kept an unfinished replay for the next one.
+pub(super) async fn run_pass_once<I, S>(client: &I, tracker: &CurvyLifecycleTracker<S>) -> Result<bool, PassError>
+where
+    I: CurvyIndexSource,
+    S: CurvyDepositState,
+{
+    let replay = tracker.take_replay();
+    match catch_up_pass(client, tracker, replay.as_ref()).await {
+        Ok(replay_kept) => Ok(replay_kept),
+        Err(error) => {
+            tracker.restore_failed_replay(replay);
+            Err(error)
+        }
+    }
 }
 
 /// The watcher loop: polls Blokli while anybody is waiting, and idles otherwise.
@@ -763,18 +1002,15 @@ where
             continue;
         }
 
-        let replay = tracker.take_replay();
-        let delay = match catch_up(client.as_ref(), tracker.as_ref(), replay.as_ref()).await {
-            Ok(()) => {
+        let delay = match run_pass_once(client.as_ref(), tracker.as_ref()).await {
+            Ok(_) => {
                 retry_delay = RECONNECT_DELAY;
                 RECONNECT_DELAY
             }
             Err(error) => {
-                let replayed = replay.is_some();
-                tracker.restore_failed_replay(replay);
                 let delay = retry_delay;
                 retry_delay = retry_delay.saturating_mul(2).min(cap);
-                tracing::warn!(%error, replayed, retry_in = ?delay,
+                tracing::warn!(%error, replayed = error.replayed, retry_in = ?delay,
                     "failed to catch up Curvy PIX notes; retrying without losing historical replay");
                 delay
             }
