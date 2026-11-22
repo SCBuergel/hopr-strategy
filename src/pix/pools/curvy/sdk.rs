@@ -105,15 +105,21 @@ const MAX_NOTE_SELECTION_STEPS: usize = 1 << 16;
 const MAX_RELAY_AGGREGATION_ATTEMPTS: usize = 8;
 /// Three full inclusion waits without observed progress permit a replacement on the next call.
 const MAX_RELAY_TIMEOUTS_WITHOUT_PROGRESS: u8 = 3;
-/// How many times, and how far apart, to look for the outputs of an aggregation the relayer
-/// reports as on chain. The relayer learns of the transaction before the note source has indexed
+/// How often, and after what waits, the outputs of an aggregation the relayer reports as on chain
+/// are looked for again. The relayer learns of the transaction before the note source has indexed
 /// it, so the first look can come too early; half a second later was enough in the one case
-/// measured. Kept short, because the chain lock is held meanwhile.
-const RELAY_OUTPUT_OBSERVATIONS: usize = 20;
+/// measured. The wait doubles from the first delay up to the longest one, so a short lag costs
+/// little and a long one few lookups: with these values the looks come 0.25, 0.75, 1.75, 3.75,
+/// 5.75, 7.75 and 9.75 s after the first. Kept short, because the chain lock is held meanwhile.
+const RELAY_OUTPUT_RETRIES: usize = 7;
 #[cfg(not(test))]
-const RELAY_OUTPUT_OBSERVATION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const RELAY_OUTPUT_FIRST_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+#[cfg(not(test))]
+const RELAY_OUTPUT_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(test)]
-const RELAY_OUTPUT_OBSERVATION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const RELAY_OUTPUT_FIRST_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+#[cfg(test)]
+const RELAY_OUTPUT_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
 /// A finality check runs once per call, with backoff between full snapshots.
 const RELAY_FINALITY_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 const RELAY_FINALITY_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -2656,26 +2662,51 @@ where
     /// The note source indexes the transaction a moment after the relayer reports it. A single
     /// look that comes in between finds no outputs, and the landed aggregation would be reported
     /// as ambiguous: its deposit is made, but the caller is told it is not. So the outputs are
-    /// looked for a few more times before giving up.
+    /// looked for again, with a growing wait in between, before giving up.
     async fn observe_relay_winner(
         &self,
         attempts: &[StoredRelayAggregation],
     ) -> Result<Option<usize>, RsSdkCurvyAdapterError> {
-        for observation in 0..RELAY_OUTPUT_OBSERVATIONS {
-            if observation > 0 {
-                tokio::time::sleep(RELAY_OUTPUT_OBSERVATION_INTERVAL).await;
+        use backon::Retryable;
+
+        /// Why a look found no winner: only outputs that are not indexed yet are worth another look.
+        enum Look {
+            NotIndexed,
+            Failed(RsSdkCurvyAdapterError),
+        }
+        // No jitter: one caller looks, with the chain lock held, so the wait should stay bounded.
+        let backoff = backon::ExponentialBuilder::default()
+            .with_min_delay(RELAY_OUTPUT_FIRST_DELAY)
+            .with_max_delay(RELAY_OUTPUT_MAX_DELAY)
+            .with_factor(2.0)
+            .with_max_times(RELAY_OUTPUT_RETRIES);
+        let looks = std::sync::atomic::AtomicUsize::new(0);
+        let winner = (|| async {
+            looks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match self.relay_winner(attempts).await {
+                Ok(Some(winner)) => Ok(winner),
+                Ok(None) => Err(Look::NotIndexed),
+                Err(error) => Err(Look::Failed(error)),
             }
-            if let Some(winner) = self.relay_winner(attempts).await? {
-                if observation > 0 {
+        })
+        .retry(backoff)
+        .sleep(backon::FuturesTimerSleeper)
+        .when(|look| matches!(look, Look::NotIndexed))
+        .await;
+        match winner {
+            Ok(winner) => {
+                let looks = looks.into_inner();
+                if looks > 1 {
                     tracing::info!(
-                        observations = observation + 1,
+                        observations = looks,
                         "the note source indexed a relayed Curvy aggregation after the relayer reported it"
                     );
                 }
-                return Ok(Some(winner));
+                Ok(Some(winner))
             }
+            Err(Look::NotIndexed) => Ok(None),
+            Err(Look::Failed(error)) => Err(error),
         }
-        Ok(None)
     }
 
     /// Called with the chain lock held before funding operations, never by the read-only
@@ -6403,7 +6434,7 @@ mod tests {
             adapter.reconcile_relay_aggregation().await,
             Err(RsSdkCurvyAdapterError::AmbiguousAllocation)
         ));
-        assert_eq!(lookups.load(Ordering::SeqCst), RELAY_OUTPUT_OBSERVATIONS);
+        assert_eq!(lookups.load(Ordering::SeqCst), RELAY_OUTPUT_RETRIES + 1);
         assert_eq!(adapter.store.load()?.relay_aggregations.len(), 1);
         assert_eq!(
             adapter.store.allocation(&record.id)?.unwrap().stage,
