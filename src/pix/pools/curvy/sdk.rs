@@ -105,6 +105,15 @@ const MAX_NOTE_SELECTION_STEPS: usize = 1 << 16;
 const MAX_RELAY_AGGREGATION_ATTEMPTS: usize = 8;
 /// Three full inclusion waits without observed progress permit a replacement on the next call.
 const MAX_RELAY_TIMEOUTS_WITHOUT_PROGRESS: u8 = 3;
+/// How many times, and how far apart, to look for the outputs of an aggregation the relayer
+/// reports as on chain. The relayer learns of the transaction before the note source has indexed
+/// it, so the first look can come too early; half a second later was enough in the one case
+/// measured. Kept short, because the chain lock is held meanwhile.
+const RELAY_OUTPUT_OBSERVATIONS: usize = 20;
+#[cfg(not(test))]
+const RELAY_OUTPUT_OBSERVATION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(test)]
+const RELAY_OUTPUT_OBSERVATION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 /// A finality check runs once per call, with backoff between full snapshots.
 const RELAY_FINALITY_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 const RELAY_FINALITY_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -2642,6 +2651,33 @@ where
         Ok(None)
     }
 
+    /// The winner of an aggregation the relayer has just reported as on chain.
+    ///
+    /// The note source indexes the transaction a moment after the relayer reports it. A single
+    /// look that comes in between finds no outputs, and the landed aggregation would be reported
+    /// as ambiguous: its deposit is made, but the caller is told it is not. So the outputs are
+    /// looked for a few more times before giving up.
+    async fn observe_relay_winner(
+        &self,
+        attempts: &[StoredRelayAggregation],
+    ) -> Result<Option<usize>, RsSdkCurvyAdapterError> {
+        for observation in 0..RELAY_OUTPUT_OBSERVATIONS {
+            if observation > 0 {
+                tokio::time::sleep(RELAY_OUTPUT_OBSERVATION_INTERVAL).await;
+            }
+            if let Some(winner) = self.relay_winner(attempts).await? {
+                if observation > 0 {
+                    tracing::info!(
+                        observations = observation + 1,
+                        "the note source indexed a relayed Curvy aggregation after the relayer reported it"
+                    );
+                }
+                return Ok(Some(winner));
+            }
+        }
+        Ok(None)
+    }
+
     /// Called with the chain lock held before funding operations, never by the read-only
     /// deployment consistency check. At most one replacement is proved per invocation.
     async fn reconcile_relay_aggregation(&self) -> Result<Option<RelayAggregationOutcome>, RsSdkCurvyAdapterError> {
@@ -2834,7 +2870,7 @@ where
             self.save_relay_attempt(index, pending)?;
             // A 409 can refer to an older candidate. Identify the winner by its outputs.
             let attempts = self.state.lock().relay_aggregations.clone();
-            let Some(winner) = self.relay_winner(&attempts).await? else {
+            let Some(winner) = self.observe_relay_winner(&attempts).await? else {
                 return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
             };
             // Persist metadata before waiting for finality, including a conflict that
@@ -6294,6 +6330,96 @@ mod tests {
         let adapter = test_adapter(&state, server.url.clone())?;
         adapter.reconcile_relay_aggregation().await?;
         assert_eq!(adapter.store.load()?.funding, vec![change]);
+        Ok(())
+    }
+
+    /// The relayer reports inclusion before the note source has indexed the outputs. The
+    /// aggregation landed, so it must complete rather than be reported as ambiguous.
+    #[tokio::test]
+    async fn relayed_aggregation_completes_when_the_note_source_lags_the_relayer() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let server = relayer::http_tests::Server::new({
+            let lookups = lookups.clone();
+            let submissions = submissions.clone();
+            move |path, _| {
+                if path == "/graphql" {
+                    // Unknown for the first two looks, indexed from the third.
+                    return Some(note_status_response(lookups.fetch_add(1, Ordering::SeqCst) >= 2));
+                }
+                if path == "/relay/submit" {
+                    submissions.fetch_add(1, Ordering::SeqCst);
+                }
+                Some((200, serde_json::json!({"requestId":"saved","status":"included"})))
+            }
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let (record, change) = prepare_recovery_fixture(&adapter)?;
+        let outcome = adapter.reconcile_relay_aggregation().await?;
+        assert!(outcome.is_some(), "the landed aggregation is reported as done");
+        assert!(lookups.load(Ordering::SeqCst) >= 3, "the outputs were looked for again");
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        let durable = adapter.store.load()?;
+        assert!(durable.relay_aggregations.is_empty());
+        assert_eq!(durable.funding, vec![change]);
+        assert_eq!(
+            adapter.store.allocation(&record.id)?.unwrap().stage,
+            StoredAllocationStage::Completed
+        );
+        Ok(())
+    }
+
+    /// Outputs that stay unknown for every look still leave the aggregation ambiguous, and it
+    /// completes on a later call without being proved or posted again.
+    #[tokio::test]
+    async fn relayed_aggregation_stays_ambiguous_until_the_note_source_knows_its_outputs() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let indexed = Arc::new(AtomicBool::new(false));
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let server = relayer::http_tests::Server::new({
+            let indexed = indexed.clone();
+            let lookups = lookups.clone();
+            let submissions = submissions.clone();
+            move |path, _| {
+                if path == "/graphql" {
+                    lookups.fetch_add(1, Ordering::SeqCst);
+                    return Some(note_status_response(indexed.load(Ordering::SeqCst)));
+                }
+                if path == "/relay/submit" {
+                    submissions.fetch_add(1, Ordering::SeqCst);
+                }
+                Some((200, serde_json::json!({"requestId":"saved","status":"included"})))
+            }
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let (record, change) = prepare_recovery_fixture(&adapter)?;
+        assert!(matches!(
+            adapter.reconcile_relay_aggregation().await,
+            Err(RsSdkCurvyAdapterError::AmbiguousAllocation)
+        ));
+        assert_eq!(lookups.load(Ordering::SeqCst), RELAY_OUTPUT_OBSERVATIONS);
+        assert_eq!(adapter.store.load()?.relay_aggregations.len(), 1);
+        assert_eq!(
+            adapter.store.allocation(&record.id)?.unwrap().stage,
+            StoredAllocationStage::Prepared
+        );
+
+        indexed.store(true, Ordering::SeqCst);
+        adapter.reconcile_relay_aggregation().await?;
+        let durable = adapter.store.load()?;
+        assert!(durable.relay_aggregations.is_empty());
+        assert_eq!(durable.funding, vec![change]);
+        assert_eq!(
+            adapter.store.allocation(&record.id)?.unwrap().stage,
+            StoredAllocationStage::Completed
+        );
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
